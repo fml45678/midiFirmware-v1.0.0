@@ -15,6 +15,11 @@ CRGB leds[NUM_LEDS];
 #include <esp_wifi.h>
 #include <esp_bt.h>
 #include <driver/rtc_io.h>
+// Filesystem for storing config
+#include <LittleFS.h>
+#include <FS.h>
+// JSON parsing
+#include <ArduinoJson.h>
 
 // Centralized MIDI channel used by buttons and pots. Change here to reassign all controls.
 constexpr auto MIDI_CHANNEL = CHANNEL_3;
@@ -28,32 +33,53 @@ BidirectionalMIDI_PipeFactory<3> pipes;
 
 // Inactivity timer
 unsigned long lastActivityTime = 0;
-constexpr unsigned long sleepTimeout = 15000; // 4 minutes in ms
+constexpr unsigned long sleepTimeout = 60000; // 4 minutes in ms
 
 
-// Button definitions
+// Button and wake pin definitions
+// Hardware pin mapping
 constexpr int BUTTON_PINS[] = {7, 8, 9, 39, 40, 41, 44};
 // Wake pins to use for EXT1 wake on this board (Seeed XIAO S3) - user requested
 constexpr int WAKE_PINS[] = {7, 8, 9};
-NoteButton buttons[] = {
-  NoteButton(BUTTON_PINS[0], {MIDI_Notes::C(4), MIDI_CHANNEL}),
-  NoteButton(BUTTON_PINS[1], {MIDI_Notes::D(4), MIDI_CHANNEL}),
-  NoteButton(BUTTON_PINS[2], {MIDI_Notes::E(4), MIDI_CHANNEL}),
-  NoteButton(BUTTON_PINS[3], {MIDI_Notes::G(4), MIDI_CHANNEL}),
-  NoteButton(BUTTON_PINS[4], {MIDI_Notes::A(4), MIDI_CHANNEL}),
-  NoteButton(BUTTON_PINS[5], {MIDI_Notes::B(4), MIDI_CHANNEL}),
-  NoteButton(BUTTON_PINS[6], {MIDI_Notes::C(5), MIDI_CHANNEL}),
+
+// Runtime control containers (constructed in setup() from config or defaults)
+NoteButton* buttons[7] = {nullptr};
+CCPotentiometer* pots[6] = {nullptr};
+
+// Default mapping data (used if no config present)
+constexpr int DEFAULT_BUTTON_NOTES[7] = {
+  MIDI_Notes::C(4), MIDI_Notes::D(4), MIDI_Notes::E(4), MIDI_Notes::G(4),
+  MIDI_Notes::A(4), MIDI_Notes::B(4), MIDI_Notes::C(5)
+};
+constexpr int DEFAULT_POT_CCS[6] = {
+  MIDI_CC::Channel_Volume, MIDI_CC::Pan, MIDI_CC::Modulation_Wheel,
+  MIDI_CC::Portamento_Time, MIDI_CC::Balance, MIDI_CC::Effect_Control_1
 };
 
-// Potentiometer definitions (grouped into an array for easier iteration)
-CCPotentiometer pots[] = {
-  CCPotentiometer(1, {MIDI_CC::Channel_Volume, MIDI_CHANNEL}),
-  CCPotentiometer(2, {MIDI_CC::Pan, MIDI_CHANNEL}),
-  CCPotentiometer(3, {MIDI_CC::Modulation_Wheel, MIDI_CHANNEL}),
-  CCPotentiometer(4, {MIDI_CC::Portamento_Time, MIDI_CHANNEL}),
-  CCPotentiometer(5, {MIDI_CC::Balance, MIDI_CHANNEL}),
-  CCPotentiometer(6, {MIDI_CC::Effect_Control_1, MIDI_CHANNEL}),
-};
+// Simple helper: find "<id>" in json and extract the following "channel" number.
+int extractChannelFromJson(const String &json, const char *id, int fallback) {
+  String key = String("\"") + id + "\"";
+  int idx = json.indexOf(key);
+  if (idx < 0) return fallback;
+  int chIdx = json.indexOf("\"channel\"", idx);
+  if (chIdx < 0) return fallback;
+  int colon = json.indexOf(':', chIdx);
+  if (colon < 0) return fallback;
+  // read number after colon
+  int i = colon + 1;
+  // skip spaces
+  while (i < json.length() && isSpace(json[i])) ++i;
+  int val = 0;
+  bool found = false;
+  while (i < json.length() && isDigit(json[i])) {
+    found = true;
+    val = val * 10 + (json[i] - '0');
+    ++i;
+  }
+  return found ? val : fallback;
+}
+
+
 
 // Track current LED color to avoid redundant FastLED.show() calls
 CRGB currentLEDColor = CRGB::Black;
@@ -230,6 +256,151 @@ void handleWakeup() {
   // WiFi will be re-initialized automatically by the WiFi library if needed
 }
 
+// --- Configuration receive / persistence ---
+// We'll accept config via SysEx over USB-MIDI and as newline-terminated JSON over Serial.
+String sysexBuffer;
+bool receivingSysEx = false;
+
+void applyConfigJson(const String &json) {
+  Serial.print("Received config JSON length: "); Serial.println(json.length());
+  // Persist to LittleFS
+  if (!LittleFS.begin()) {
+    Serial.println("LittleFS mount failed");
+    return;
+  }
+  File f = LittleFS.open("/config.json", FILE_WRITE);
+  if (!f) {
+    Serial.println("Failed to open config file for writing");
+    return;
+  }
+  f.print(json);
+  f.close();
+  Serial.println("Config written to /config.json");
+  // Apply immediately
+  constructControlsFromConfig(json);
+
+  // Send a simple SysEx ACK back: [F0 7D 02 01 F7]
+#if defined(usbMIDI)
+  byte ack[] = {0xF0, 0x7D, 0x02, 0x01, 0xF7};
+  // Attempt to send on the USBMIDI interface
+  midi.send(ack, sizeof(ack));
+#endif
+}
+
+// Read config.json from LittleFS and return as String; empty if not present
+String readConfigFile() {
+  if (!LittleFS.begin()) {
+    Serial.println("LittleFS mount failed (read)");
+    return "";
+  }
+  if (!LittleFS.exists("/config.json")) {
+    Serial.println("No config.json found");
+    return "";
+  }
+  File f = LittleFS.open("/config.json", FILE_READ);
+  if (!f) {
+    Serial.println("Failed to open config.json");
+    return "";
+  }
+  String s;
+  while (f.available()) s += (char)f.read();
+  f.close();
+  return s;
+}
+
+// Small integer fallback channel for JSON parsing and runtime assignment.
+// We keep the library's `MIDI_CHANNEL` as-is (it is a Control Surface
+// Channel constant), but use a plain int for JSON/default handling.
+constexpr int DEFAULT_MIDI_CHANNEL = 3;
+
+// Lightweight wrapper kept for compatibility: forward to the main constructor
+void createControlsFromConfig(const String &json) {
+  constructControlsFromConfig(json);
+}
+
+// Construct runtime control objects from JSON config (or defaults)
+void constructControlsFromConfig(const String &json) {
+  // Free any existing objects
+  for (int i = 0; i < 7; ++i) {
+    if (buttons[i]) { delete buttons[i]; buttons[i] = nullptr; }
+  }
+  for (int i = 0; i < 6; ++i) {
+    if (pots[i]) { delete pots[i]; pots[i] = nullptr; }
+  }
+
+  // Default channel
+  int defaultChannel = DEFAULT_MIDI_CHANNEL;
+
+  // Parse JSON if present
+  DynamicJsonDocument doc(8192);
+  if (json.length() > 0) {
+    DeserializationError err = deserializeJson(doc, json);
+    if (err) {
+      Serial.print("JSON parse error: "); Serial.println(err.c_str());
+    }
+  }
+
+  // Build buttons
+  for (int i = 0; i < 7; ++i) {
+    int pin = BUTTON_PINS[i];
+    int note = DEFAULT_BUTTON_NOTES[i];
+    int channel = defaultChannel;
+    // If config exists for button_i use its channel/value
+    char idbuf[16];
+    sprintf(idbuf, "button_%d", i+1);
+    if (doc.containsKey(idbuf)) {
+      JsonObject obj = doc[idbuf];
+      if (obj.containsKey("channel")) channel = obj["channel"].as<int>();
+      if (obj.containsKey("note")) note = obj["note"].as<int>();
+    }
+  // Construct a MIDIAddress (note + channel) for the NoteButton
+  cs::MIDIAddress addr_note = cs::MIDIAddress(note, static_cast<cs::Channel>(channel));
+  buttons[i] = new NoteButton(pin, addr_note);
+  }
+
+  // Build pots
+  for (int i = 0; i < 6; ++i) {
+    int index = i+1; // Control Surface pot indices are 1-based
+    int cc = DEFAULT_POT_CCS[i];
+    int channel = defaultChannel;
+    char idbuf[16];
+    sprintf(idbuf, "knob_%d", index);
+    if (doc.containsKey(idbuf)) {
+      JsonObject obj = doc[idbuf];
+      if (obj.containsKey("channel")) channel = obj["channel"].as<int>();
+      if (obj.containsKey("cc")) cc = obj["cc"].as<int>();
+    }
+  // Construct a MIDIAddress (CC + channel) for the CCPotentiometer
+  cs::MIDIAddress addr_cc = cs::MIDIAddress(cc, static_cast<cs::Channel>(channel));
+  pots[i] = new CCPotentiometer(index, addr_cc);
+  }
+
+  Serial.println("Controls constructed from config/defaults");
+}
+
+// Try to read SysEx from available MIDI sources
+void pollSysEx() {
+  // Try raw usbMIDI if available (Arduino core)
+#if defined(usbMIDI)
+  while (usbMIDI.read()) {
+    if (usbMIDI.getType() == usbMIDI.SysEx) {
+      // usbMIDI packages full SysEx messages; getSysEx is not universally available,
+      // so collect bytes via getSysExData if present. Fallback: use getSysEx toString.
+      auto len = usbMIDI.getSysExSize();
+      sysexBuffer = "";
+      for (size_t i = 0; i < len; ++i) {
+        int b = usbMIDI.getSysExData(i);
+        sysexBuffer += (char)b;
+      }
+      applyConfigJson(sysexBuffer);
+    }
+  }
+#endif
+
+  // Fallback: if Control Surface exposes a MIDI input pipe, it could be used here.
+  // As a universal fallback we also support Serial-line JSON input handled in loop().
+}
+
 void setup() {
   // Start Serial first so wakeup diagnostics are visible immediately
   Serial.begin(115200);
@@ -237,6 +408,9 @@ void setup() {
   Serial.println("--- boot ---");
   // Handle wake up from deep sleep (prints will now be visible)
   handleWakeup();
+  // Read persisted config and construct controls
+  String cfg = readConfigFile();
+  constructControlsFromConfig(cfg);
   Control_Surface | pipes | midi;
   Control_Surface | pipes | bmidi;
   Control_Surface | pipes | serialmidi;
@@ -262,8 +436,8 @@ void setup() {
 void loop() {
   Control_Surface.loop(); 
   // Handle button LED updates and activity by iterating the buttons array
-  for (auto &btn : buttons) {
-    handleButtonLED(btn);
+  for (int i = 0; i < 7; ++i) {
+    if (buttons[i]) handleButtonLED(*buttons[i]);
   }
   
 
@@ -271,5 +445,24 @@ void loop() {
   // Check for inactivity
   if (millis() - lastActivityTime > sleepTimeout) {
     goToSleep();
+  }
+
+  // Poll for incoming SysEx via MIDI
+  pollSysEx();
+
+  // Serial fallback: read newline-terminated JSON config
+  static String serialLine = "";
+  while (Serial.available()) {
+    char c = (char)Serial.read();
+    if (c == '\n') {
+      if (serialLine.length() > 0) {
+        applyConfigJson(serialLine);
+        serialLine = "";
+      }
+    } else {
+      serialLine += c;
+      // guard against runaway lines
+      if (serialLine.length() > 8192) serialLine = serialLine.substring(serialLine.length() - 8192);
+    }
   }
 }
