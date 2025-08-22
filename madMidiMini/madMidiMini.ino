@@ -3,12 +3,12 @@
  * https://github.com/tttapa/Control-Surface
  */
 #include <FastLED.h>
-constexpr int NUM_LEDS = 4;
-constexpr int DATA_PIN = 42;
+constexpr int NUM_LEDS = 2;
+constexpr int DATA_PIN = 13;
 CRGB leds[NUM_LEDS];
 
 // Uncomment to disable actual deep sleep for debugging wake logic (keeps Serial alive)
-// #define DEBUG_NO_SLEEP
+#define DEBUG_NO_SLEEP
 
 #include <Control_Surface.h> // Include the Control Surface library
 #include <esp_sleep.h>
@@ -26,6 +26,12 @@ CRGB leds[NUM_LEDS];
 // Centralized MIDI channel used by buttons and pots. Change here to reassign all controls.
 constexpr auto MIDI_CHANNEL = CHANNEL_3;
 
+// Board-specific counts — keep these in sync with BUTTON_PINS / any pot wiring
+constexpr int BUTTON_COUNT = 2;
+constexpr int POT_COUNT = 2;
+// If you wire pots to specific ADC pins and need to document them, update here.
+constexpr int POT_PINS[] = {1, 2};
+
 // Instantiate a MIDI over USB interface or Bluetooth.
 USBMIDI_Interface midi;
 BluetoothMIDI_Interface bmidi;
@@ -37,26 +43,39 @@ BidirectionalMIDI_PipeFactory<3> pipes;
 unsigned long lastActivityTime = 0;
 constexpr unsigned long sleepTimeout = 120000; // 2 minutes in ms
 
+// Runtime override to prevent deep sleep (useful if compile-time DEBUG_NO_SLEEP
+// wasn't applied or you want to toggle at runtime). Set to `true` to keep the
+// device awake while debugging.
+bool FORCE_NO_SLEEP = true;
+
 
 // Button and wake pin definitions
 // Hardware pin mapping
-constexpr int BUTTON_PINS[] = {7, 8, 9, 39, 40, 41, 44};
+constexpr int BUTTON_PINS[] = {3,4};
 // Wake pins to use for EXT1 wake on this board (Seeed XIAO S3) - user requested
-constexpr int WAKE_PINS[] = {7, 8, 9};
+constexpr int WAKE_PINS[] = {3,4};
 
 // Runtime control containers (constructed in setup() from config or defaults)
-NoteButton* buttons[7] = {nullptr};
-CCPotentiometer* pots[6] = {nullptr};
+NoteButton* buttons[BUTTON_COUNT] = {nullptr};
+CCPotentiometer* pots[POT_COUNT] = {nullptr};
 
 // Default mapping data (used if no config present)
-constexpr int DEFAULT_BUTTON_NOTES[7] = {
-  MIDI_Notes::C(4), MIDI_Notes::D(4), MIDI_Notes::E(4), MIDI_Notes::G(4),
-  MIDI_Notes::A(4), MIDI_Notes::B(4), MIDI_Notes::C(5)
+constexpr int DEFAULT_BUTTON_NOTES[2] = {
+  MIDI_Notes::C(4), MIDI_Notes::D(4)
 };
-constexpr int DEFAULT_POT_CCS[6] = {
-  MIDI_CC::Channel_Volume, MIDI_CC::Pan, MIDI_CC::Modulation_Wheel,
-  MIDI_CC::Portamento_Time, MIDI_CC::Balance, MIDI_CC::Effect_Control_1
+constexpr int DEFAULT_POT_CCS[2] = {
+  MIDI_CC::Channel_Volume, MIDI_CC::Pan
 };
+
+// Per-control default channels (user-facing 1..16). Keep in sync with counts.
+constexpr int DEFAULT_BUTTON_CHANNELS[BUTTON_COUNT] = { DEFAULT_MIDI_CHANNEL, DEFAULT_MIDI_CHANNEL };
+constexpr int DEFAULT_POT_CHANNELS[POT_COUNT] = { DEFAULT_MIDI_CHANNEL, DEFAULT_MIDI_CHANNEL };
+
+// Compile-time checks to ensure the pin arrays match the counts
+static_assert((int)(sizeof(BUTTON_PINS)/sizeof(BUTTON_PINS[0])) == BUTTON_COUNT, "BUTTON_PINS size must equal BUTTON_COUNT");
+static_assert((int)(sizeof(POT_PINS)/sizeof(POT_PINS[0])) == POT_COUNT, "POT_PINS size must equal POT_COUNT");
+static_assert((int)(sizeof(DEFAULT_BUTTON_NOTES)/sizeof(DEFAULT_BUTTON_NOTES[0])) == BUTTON_COUNT, "DEFAULT_BUTTON_NOTES size must equal BUTTON_COUNT");
+static_assert((int)(sizeof(DEFAULT_POT_CCS)/sizeof(DEFAULT_POT_CCS[0])) == POT_COUNT, "DEFAULT_POT_CCS size must equal POT_COUNT");
 
 // Simple helper: find "<id>" in json and extract the following "channel" number.
 int extractChannelFromJson(const String &json, const char *id, int fallback) {
@@ -115,6 +134,13 @@ void handleButtonLED(NoteButton &btn) {
 void goToSleep() {
   // Turn off LEDs before sleeping
   setAllLEDs(CRGB::Black);
+  // Runtime override: if FORCE_NO_SLEEP is true, skip entering deep sleep.
+  if (FORCE_NO_SLEEP) {
+    Serial.println("[FORCE_NO_SLEEP] Runtime override active — skipping deep sleep");
+    // Mirror to Serial1 if available for hardware UART debugging
+    Serial1.println("[FORCE_NO_SLEEP] Runtime override active — skipping deep sleep");
+    return;
+  }
   
   // Disable WiFi and Bluetooth to save power
   esp_wifi_stop();
@@ -364,10 +390,10 @@ void createControlsFromConfig(const String &json) {
 // Construct runtime control objects from JSON config (or defaults)
 void constructControlsFromConfig(const String &json) {
   // Free any existing objects
-  for (int i = 0; i < 7; ++i) {
+  for (int i = 0; i < BUTTON_COUNT; ++i) {
     if (buttons[i]) { delete buttons[i]; buttons[i] = nullptr; }
   }
-  for (int i = 0; i < 6; ++i) {
+  for (int i = 0; i < POT_COUNT; ++i) {
     if (pots[i]) { delete pots[i]; pots[i] = nullptr; }
   }
 
@@ -384,10 +410,10 @@ void constructControlsFromConfig(const String &json) {
   }
 
   // Build buttons
-  for (int i = 0; i < 7; ++i) {
+  for (int i = 0; i < BUTTON_COUNT; ++i) {
     int pin = BUTTON_PINS[i];
     int note = DEFAULT_BUTTON_NOTES[i];
-    int channel = defaultChannel;
+  int channel = DEFAULT_BUTTON_CHANNELS[i];
     // If config exists for button_i use its channel/value
     char idbuf[16];
     sprintf(idbuf, "button_%d", i+1);
@@ -396,16 +422,24 @@ void constructControlsFromConfig(const String &json) {
       if (obj.containsKey("channel")) channel = obj["channel"].as<int>();
       if (obj.containsKey("note")) note = obj["note"].as<int>();
     }
+    // Clamp to 1..16 and convert to Control Surface's 0-based cs::Channel
+    if (channel < 1) channel = 1;
+    if (channel > 16) channel = 16;
+    int csChannel = channel - 1;
   // Construct a MIDIAddress (note + channel) for the NoteButton
-  cs::MIDIAddress addr_note = cs::MIDIAddress(note, static_cast<cs::Channel>(channel));
+  cs::MIDIAddress addr_note = cs::MIDIAddress(note, static_cast<cs::Channel>(csChannel));
   buttons[i] = new NoteButton(pin, addr_note);
+  // Debug print
+  Serial.print("Constructed NoteButton pin="); Serial.print(pin);
+  Serial.print(" note="); Serial.print(note);
+  Serial.print(" channel="); Serial.println(channel);
   }
 
   // Build pots
-  for (int i = 0; i < 6; ++i) {
+  for (int i = 0; i < POT_COUNT; ++i) {
     int index = i+1; // Control Surface pot indices are 1-based
     int cc = DEFAULT_POT_CCS[i];
-    int channel = defaultChannel;
+  int channel = DEFAULT_POT_CHANNELS[i];
     char idbuf[16];
     sprintf(idbuf, "knob_%d", index);
     if (doc.containsKey(idbuf)) {
@@ -413,9 +447,17 @@ void constructControlsFromConfig(const String &json) {
       if (obj.containsKey("channel")) channel = obj["channel"].as<int>();
       if (obj.containsKey("cc")) cc = obj["cc"].as<int>();
     }
+    // Clamp to 1..16 and convert to Control Surface's 0-based cs::Channel
+    if (channel < 1) channel = 1;
+    if (channel > 16) channel = 16;
+    int csChannel = channel - 1;
   // Construct a MIDIAddress (CC + channel) for the CCPotentiometer
-  cs::MIDIAddress addr_cc = cs::MIDIAddress(cc, static_cast<cs::Channel>(channel));
+  cs::MIDIAddress addr_cc = cs::MIDIAddress(cc, static_cast<cs::Channel>(csChannel));
   pots[i] = new CCPotentiometer(index, addr_cc);
+  // Debug print
+  Serial.print("Constructed CCPotentiometer index="); Serial.print(index);
+  Serial.print(" cc="); Serial.print(cc);
+  Serial.print(" channel="); Serial.println(channel);
   }
 
   Serial.println("Controls constructed from config/defaults");
@@ -444,7 +486,49 @@ void pollSysEx() {
       }
       Serial.println();
       Serial.print("Collected SysEx payload len: "); Serial.println(sysexBuffer.length());
-      applyConfigJson(sysexBuffer);
+      // If this is a request for config (manufacturer 0x7D, cmd 0x03)
+      if (sysexBuffer.length() >= 2 && (uint8_t)sysexBuffer[0] == 0x7D && (uint8_t)sysexBuffer[1] == 0x03) {
+        Serial.println("Config request SysEx received — sending config reply");
+        // Read stored config (prefer FS, fallback to Preferences)
+        String cfg = readConfigFile();
+        if (cfg.length() == 0 && prefs.isKey("cfg")) cfg = prefs.getString("cfg", "");
+        if (cfg.length() == 0) {
+          Serial.println("No config stored — sending empty JSON {}");
+          cfg = "{}";
+        }
+        // Build a framed SysEx: F0 7D 04 <payload bytes...> F7 (0x04 = config reply)
+        size_t payloadLen = cfg.length();
+        size_t totalLen = payloadLen + 5; // F0 7D 04 ... F7
+        uint8_t *buf = (uint8_t *)malloc(totalLen);
+        if (buf) {
+          buf[0] = 0xF0;
+          buf[1] = 0x7D;
+          buf[2] = 0x04;
+          for (size_t j = 0; j < payloadLen; ++j) buf[3 + j] = (uint8_t)cfg[j];
+          buf[3 + payloadLen] = 0xF7;
+#if defined(usbMIDI)
+#if defined(usbMIDI)
+          usbMIDI.sendSysEx(totalLen, buf);
+          Serial.println("Sent SysEx config reply (usbMIDI)");
+          // Small delay to give the host a chance to receive/dispatch the SysEx
+          delay(60);
+          // Send a short Control Change as a presence ping so browsers that
+          // don't deliver SysEx reliably still see device activity. Use CC#5
+          // on channel 1 (Control Surface channels are 0-based here).
+          usbMIDI.sendControlChange(5, 127, 0);
+          Serial.println("Sent CC presence ping (usbMIDI)");
+#else
+          Serial.println("usbMIDI not available; printing config to Serial instead:");
+          Serial.println(cfg);
+#endif
+          free(buf);
+        } else {
+          Serial.println("Memory allocation failed; cannot send config reply");
+        }
+      } else {
+        // Otherwise treat incoming SysEx as a config JSON payload to apply
+        applyConfigJson(sysexBuffer);
+      }
   // Visual debug: Purple pulse to indicate SysEx arrived
   setAllLEDs(CRGB::Purple);
   delay(80);
@@ -478,8 +562,8 @@ void pollSysEx() {
 void setup() {
   // Start Serial first so wakeup diagnostics are visible immediately
   Serial.begin(115200);
-  delay(50);
-  Serial.println("--- boot ---");
+  delay(2000);
+  Serial.println("--- boot --- (DEBUG_NO_SLEEP)");
   // Handle wake up from deep sleep (prints will now be visible)
   handleWakeup();
   // Attempt to mount a filesystem for config persistence
@@ -525,9 +609,16 @@ void setup() {
 }
 
 void loop() {
+#ifdef DEBUG_NO_SLEEP
+  static unsigned long hb_last = 0;
+  if (millis() - hb_last > 1000) {
+    hb_last = millis();
+    Serial.println("[DEBUG HEARTBEAT]");
+  }
+#endif
   Control_Surface.loop(); 
   // Handle button LED updates and activity by iterating the buttons array
-  for (int i = 0; i < 7; ++i) {
+  for (int i = 0; i < BUTTON_COUNT; ++i) {
     if (buttons[i]) handleButtonLED(*buttons[i]);
   }
   
